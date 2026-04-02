@@ -1,0 +1,24 @@
+# Token cache (contains auth tokens - never commit)
+.token_cache.json
+
+# Environment file (contains secrets)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
