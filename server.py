@@ -147,9 +147,115 @@ class DynamicsClient:
     # -- entity-specific queries -------------------------------------------
 
     def my_account_ids(self) -> list[dict]:
-        """Return msp_accountteams rows for the current user."""
-        filt = f"_msp_systemuserid_value eq '{USER_ID}'"
-        return self.get("msp_accountteams", {"$filter": filt})
+        """Return msp_accountteams rows for the current user.
+        Falls back to deriving accounts from deal team memberships if
+        msp_accountteams is inaccessible."""
+        try:
+            filt = f"_msp_systemuserid_value eq '{USER_ID}'"
+            rows = self.get("msp_accountteams", {"$filter": filt})
+            if rows:
+                return rows
+        except Exception:
+            pass
+        return []
+
+    def my_account_tree(self) -> dict:
+        """Derive the user's account tree from deal team memberships.
+
+        Returns dict with:
+            parent_accounts: list of top-level parent account dicts
+            all_account_ids: set of ALL account IDs (parents + children)
+            parent_ids: set of just parent account IDs
+            child_map: dict mapping child_id -> parent_id
+            name_map: dict mapping account_id -> account name
+        """
+        filt = f"_msp_dealteamuserid_value eq '{USER_ID}'"
+        deal_rows = self.get("msp_dealteams", {"$filter": filt})
+        opp_ids = list({
+            r["_msp_parentopportunityid_value"]
+            for r in deal_rows
+            if r.get("_msp_parentopportunityid_value")
+        })
+        if not opp_ids:
+            return {
+                "parent_accounts": [], "all_account_ids": set(),
+                "parent_ids": set(), "child_map": {}, "name_map": {},
+            }
+
+        opp_clauses = " or ".join(f"opportunityid eq '{oid}'" for oid in opp_ids)
+        opps = self.get("opportunities", {
+            "$filter": opp_clauses,
+            "$select": "opportunityid,_parentaccountid_value",
+        })
+        acct_ids = list({
+            o["_parentaccountid_value"] for o in opps
+            if o.get("_parentaccountid_value")
+        })
+        if not acct_ids:
+            return {
+                "parent_accounts": [], "all_account_ids": set(),
+                "parent_ids": set(), "child_map": {}, "name_map": {},
+            }
+
+        acct_clauses = " or ".join(f"accountid eq '{a}'" for a in acct_ids)
+        select = (
+            "accountid,name,accountnumber,msp_parentinglevelcode,"
+            "msp_endcustomersegmentcode,msp_industrycode,msp_managedstatuscode,"
+            "openrevenue,_parentaccountid_value,msp_activecontacts,"
+            "address1_city,address1_country,statecode"
+        )
+        accts = self.get("accounts", {"$filter": acct_clauses, "$select": select})
+
+        parent_ids: set[str] = set()
+        seen_accts = {a["accountid"]: a for a in accts}
+
+        for acct in accts:
+            parent_ref = acct.get("_parentaccountid_value")
+            if parent_ref and parent_ref not in seen_accts:
+                try:
+                    parent_acct = self.get_single(f"accounts({parent_ref})")
+                    if parent_acct:
+                        seen_accts[parent_acct["accountid"]] = parent_acct
+                        parent_ids.add(parent_acct["accountid"])
+                except Exception:
+                    parent_ids.add(acct["accountid"])
+            elif not parent_ref:
+                parent_ids.add(acct["accountid"])
+            else:
+                parent_ids.add(parent_ref)
+
+        all_ids: set[str] = set(parent_ids)
+        child_map: dict[str, str] = {}
+        name_map: dict[str, str] = {}
+
+        for pid in parent_ids:
+            children = self.get_child_accounts(pid)
+            for c in children:
+                cid = c["accountid"]
+                all_ids.add(cid)
+                child_map[cid] = pid
+                name_map[cid] = c.get("name", cid)
+
+        for pid in parent_ids:
+            if pid in seen_accts:
+                name_map[pid] = seen_accts[pid].get("name", pid)
+            else:
+                name_map[pid] = pid
+
+        parent_accounts = []
+        for pid in parent_ids:
+            if pid in seen_accts:
+                parent_accounts.append(seen_accts[pid])
+            else:
+                parent_accounts.append({"accountid": pid, "name": name_map.get(pid, pid)})
+
+        return {
+            "parent_accounts": parent_accounts,
+            "all_account_ids": all_ids,
+            "parent_ids": parent_ids,
+            "child_map": child_map,
+            "name_map": name_map,
+        }
 
     def search_account(self, name: str) -> list[dict]:
         """Case-insensitive contains search on account name."""
@@ -201,8 +307,11 @@ class DynamicsClient:
         return self.get("contacts", {"$filter": filt, "$select": select})
 
     def get_account_team(self, account_id: str) -> list[dict]:
-        filt = f"_msp_accountid_value eq '{account_id}'"
-        return self.get("msp_accountteams", {"$filter": filt})
+        try:
+            filt = f"_msp_accountid_value eq '{account_id}'"
+            return self.get("msp_accountteams", {"$filter": filt})
+        except Exception:
+            return []
 
     # -- single record & write ops -----------------------------------------
 
@@ -401,45 +510,25 @@ def _resolve_opportunity(name: str) -> dict:
 
 @mcp.tool
 def my_accounts() -> list[dict]:
-    """List all Dynamics 365 accounts assigned to me (Alexander Shaul) via msp_accountteams.
+    """List all Dynamics 365 accounts assigned to me via msp_accountteams.
 
     Returns each account's name, segment, industry, managed status,
     open revenue, and parenting level.
     """
-    team_rows = client.my_account_ids()
-    if not team_rows:
+    tree = client.my_account_tree()
+    parent_accounts = tree["parent_accounts"]
+    if not parent_accounts:
         return []
-
-    account_ids = list({r["_msp_accountid_value"] for r in team_rows if r.get("_msp_accountid_value")})
-    if not account_ids:
-        return []
-
-    # Fetch each account (batch by filter)
-    id_clauses = " or ".join(f"accountid eq '{aid}'" for aid in account_ids)
-    select = (
-        "accountid,name,accountnumber,msp_parentinglevelcode,"
-        "msp_endcustomersegmentcode,msp_industrycode,msp_managedstatuscode,"
-        "openrevenue,msp_activecontacts,address1_city,address1_country,statecode"
-    )
-    raw_accounts = client.get("accounts", {"$filter": id_clauses, "$select": select})
-
-    # Attach role info from team rows
-    role_by_acct = {}
-    for tr in team_rows:
-        aid = tr.get("_msp_accountid_value")
-        if aid:
-            role_by_acct[aid] = {
-                "role": tr.get("msp_rolename"),
-                "solution_area": tr.get("msp_solutionarea"),
-            }
 
     results = []
-    for acct in raw_accounts:
+    for acct in parent_accounts:
         cleaned = client.clean_record(acct, ACCOUNT_FIELDS)
-        aid = acct.get("accountid")
-        if aid and aid in role_by_acct:
-            cleaned["my_role"] = role_by_acct[aid]["role"]
-            cleaned["my_solution_area"] = role_by_acct[aid]["solution_area"]
+        children = client.get_child_accounts(acct["accountid"])
+        cleaned["child_account_count"] = len(children)
+        cleaned["child_accounts"] = [
+            {"accountid": c["accountid"], "name": c.get("name")}
+            for c in children
+        ]
         results.append(cleaned)
 
     return results
@@ -527,17 +616,10 @@ def search_opportunities(
         stage: Filter by sales stage (e.g. "Listen & Consult", "Inspire & Design").
         closing_before: ISO date string (e.g. "2025-12-31") — only opps closing before this date.
     """
-    # Get my accounts
-    team_rows = client.my_account_ids()
-    acct_ids = list({r["_msp_accountid_value"] for r in team_rows if r.get("_msp_accountid_value")})
-    if not acct_ids:
+    tree = client.my_account_tree()
+    all_ids = tree["all_account_ids"]
+    if not all_ids:
         return {"opportunity_count": 0, "opportunities": []}
-
-    # Also include child accounts for each parent
-    all_ids = set(acct_ids)
-    for aid in acct_ids:
-        children = client.get_child_accounts(aid)
-        all_ids.update(c["accountid"] for c in children)
 
     # Build OData filter
     id_clauses = " or ".join(f"_parentaccountid_value eq '{a}'" for a in all_ids)
@@ -588,27 +670,15 @@ def pipeline_summary() -> dict:
     Shows per-account totals, per-stage breakdown, and grand total
     of open opportunity estimated values.
     """
-    team_rows = client.my_account_ids()
-    acct_ids = list({r["_msp_accountid_value"] for r in team_rows if r.get("_msp_accountid_value")})
-    if not acct_ids:
+    tree = client.my_account_tree()
+    parent_ids = tree["parent_ids"]
+    all_ids = tree["all_account_ids"]
+    child_map = tree["child_map"]
+    name_map = tree["name_map"]
+
+    if not all_ids:
         return {"total_pipeline": 0, "by_account": {}, "by_stage": {}}
 
-    # Resolve account names
-    id_clauses = " or ".join(f"accountid eq '{a}'" for a in acct_ids)
-    raw_accts = client.get("accounts", {"$filter": id_clauses, "$select": "accountid,name"})
-    name_map = {a["accountid"]: a["name"] for a in raw_accts}
-
-    # Include children
-    all_ids = set(acct_ids)
-    child_parent_map: dict[str, str] = {}  # child_id -> parent_id
-    for aid in acct_ids:
-        children = client.get_child_accounts(aid)
-        for c in children:
-            cid = c["accountid"]
-            all_ids.add(cid)
-            child_parent_map[cid] = aid
-
-    # Fetch open opps
     raw_opps = client.get_opportunities(list(all_ids), statecode=0)
 
     by_account: dict[str, float] = {}
@@ -619,22 +689,19 @@ def pipeline_summary() -> dict:
         val = opp.get("estimatedvalue") or 0
         grand_total += val
 
-        # Map opp to parent account name
         opp_acct_id = opp.get("_parentaccountid_value")
-        parent_id = child_parent_map.get(opp_acct_id, opp_acct_id)
+        parent_id = child_map.get(opp_acct_id, opp_acct_id)
         acct_name = name_map.get(parent_id, opp.get(
             "_parentaccountid_value@OData.Community.Display.V1.FormattedValue", parent_id or "Unknown"
         ))
         by_account[acct_name] = by_account.get(acct_name, 0) + val
 
-        # Stage
         stage = opp.get(
             "msp_activesalesstage@OData.Community.Display.V1.FormattedValue",
             opp.get("msp_activesalesstage", "Unknown"),
         )
         by_stage[stage] = by_stage.get(stage, 0) + val
 
-    # Sort by value descending
     by_account = dict(sorted(by_account.items(), key=lambda x: x[1], reverse=True))
     by_stage = dict(sorted(by_stage.items(), key=lambda x: x[1], reverse=True))
 
@@ -672,6 +739,7 @@ def account_team(account_name: str) -> dict:
 
     Shows all team members, their roles, solution areas, and titles.
     If the account has no direct team, automatically checks the parent account.
+    If msp_accountteams is inaccessible, returns an appropriate message.
 
     Args:
         account_name: Full or partial account name to search for.
@@ -700,6 +768,9 @@ def account_team(account_name: str) -> dict:
                 result["inherited_from_parent"] = True
                 result["parent_account"] = parent.get("name")
                 result["parent_account_id"] = parent.get("accountid")
+
+    if not result["team_members"]:
+        result["note"] = "No team members found. The msp_accountteams entity may be inaccessible."
 
     return result
 
@@ -852,7 +923,7 @@ def opportunity_team(opportunity_name: str) -> dict:
     """Get deal team members for an opportunity via msp_dealteams.
 
     Shows all people on the deal team, their roles,
-    and whether the current user (Alexander Shaul) is on the team.
+    and whether the current user is on the team.
 
     Args:
         opportunity_name: Full or partial opportunity name.
@@ -897,7 +968,7 @@ def opportunity_team(opportunity_name: str) -> dict:
 
 @mcp.tool
 def my_opportunities() -> dict:
-    """List all opportunities where I (Alexander Shaul) am connected as a deal team member.
+    """List all opportunities where I am connected as a deal team member.
 
     Searches msp_dealteams where my user ID appears, then resolves linked opportunities.
     """
@@ -942,22 +1013,13 @@ def opportunities_not_on_team() -> dict:
     Compares all open opportunities under my accounts (including child accounts)
     against my msp_dealteams entries to find gaps.
     """
-    # Step 1: Get my accounts
-    team_rows = client.my_account_ids()
-    acct_ids = list({r["_msp_accountid_value"] for r in team_rows if r.get("_msp_accountid_value")})
-    if not acct_ids:
+    tree = client.my_account_tree()
+    all_ids = tree["all_account_ids"]
+    if not all_ids:
         return {"opportunity_count": 0, "opportunities": []}
 
-    # Include child accounts
-    all_acct_ids: set[str] = set(acct_ids)
-    for aid in acct_ids:
-        children = client.get_child_accounts(aid)
-        all_acct_ids.update(c["accountid"] for c in children)
+    all_opps = client.get_opportunities(list(all_ids), statecode=0)
 
-    # Step 2: Get all open opportunities for these accounts
-    all_opps = client.get_opportunities(list(all_acct_ids), statecode=0)
-
-    # Step 3: Get my deal team entries
     filt = f"_msp_dealteamuserid_value eq '{USER_ID}'"
     try:
         deal_rows = client.get("msp_dealteams", {"$filter": filt})
@@ -970,7 +1032,6 @@ def opportunities_not_on_team() -> dict:
         if r.get("_msp_parentopportunityid_value")
     }
 
-    # Step 4: Filter to opps I'm NOT on the deal team for
     not_on_team = [
         o for o in all_opps
         if o.get("opportunityid") not in my_opp_ids
@@ -1040,7 +1101,7 @@ def opportunity_milestones(opportunity_name: str) -> dict:
 
 @mcp.tool
 def my_milestones() -> dict:
-    """Get all milestones across opportunities where I (Alexander Shaul) am on the deal team.
+    """Get all milestones across opportunities where I am on the deal team.
 
     Finds my opportunities via msp_dealteams, then fetches milestones for each one.
     Returns milestones grouped by opportunity.
@@ -1175,7 +1236,7 @@ def update_record(entity_set: str, record_id: str, field_name: str, field_value:
 
 @mcp.tool
 def assign_to_me(entity_set: str, record_id: str) -> dict:
-    """Assign a Dynamics 365 record (milestone, task, etc.) to me (Alexander Shaul).
+    """Assign a Dynamics 365 record (milestone, task, etc.) to me.
 
     Sets the ownerid field to my user ID.
 
