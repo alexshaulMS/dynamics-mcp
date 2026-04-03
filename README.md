@@ -5,7 +5,7 @@ An MCP (Model Context Protocol) server that connects to Microsoft Dynamics 365 C
 ## Features
 
 ### Account Management
-- **`my_accounts`** — List all accounts assigned to you via `msp_accountteams`
+- **`my_accounts`** — List all parent accounts derived from your deal team memberships, with child accounts
 - **`account_details`** — Full account details including parent/child hierarchy
 - **`account_contacts`** — Get contacts for an account
 - **`account_team`** — Account team members (auto-traverses to parent if child has no team)
@@ -35,56 +35,44 @@ An MCP (Model Context Protocol) server that connects to Microsoft Dynamics 365 C
 ## Prerequisites
 
 - Python 3.10+
-- Access to a Dynamics 365 CRM instance
-- An Azure AD app registration with `user_impersonation` permissions on your Dynamics instance
+- [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) installed
+- Access to a Dynamics 365 CRM instance (e.g. `microsoftsales.crm.dynamics.com`)
+- An Azure AD app registration client ID with `Dynamics CRM user_impersonation` delegated permission (for Microsoft internal users, ask your team for the shared public client app ID)
 
 ## Setup
 
 ### 1. Clone and install dependencies
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/alexshaulMS/dynamics-mcp.git
 cd dynamics-mcp
 pip install -r requirements.txt
 ```
 
-### 2. Create a `.env` file
+### 2. Find your Dynamics User ID
 
-Copy `.env.example` and fill in your values:
-
-```bash
-cp .env.example .env
-```
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `DYNAMICS_BASE_URL` | Your Dynamics 365 instance URL | No (defaults to `https://microsoftsales.crm.dynamics.com`) |
-| `DYNAMICS_CLIENT_ID` | Azure AD app registration client ID | **Yes** |
-| `DYNAMICS_TENANT_ID` | Azure AD tenant ID | **Yes** |
-| `DYNAMICS_USER_ID` | Your `systemuserid` GUID from Dynamics 365 | **Yes** |
-
-### 3. Find your User ID
-
-To find your `systemuserid`, run this OData query in your browser (while authenticated):
+You need your `systemuserid` GUID. Open this URL in your browser while logged into Dynamics:
 
 ```
-https://<your-instance>.crm.dynamics.com/api/data/v9.2/systemusers?$filter=internalemailaddress eq 'your.email@company.com'&$select=systemuserid,fullname
+https://microsoftsales.crm.dynamics.com/api/data/v9.2/systemusers?$filter=internalemailaddress eq 'your.email@microsoft.com'&$select=systemuserid,fullname
 ```
 
-### 4. Configure GitHub Copilot CLI
+Copy the `systemuserid` value from the response.
 
-Add to your `~/.copilot/mcp-config.json`:
+### 3. Add to GitHub Copilot CLI
+
+Add the following to your `~/.copilot/mcp-config.json` (create the file if it doesn't exist):
 
 ```json
 {
   "mcpServers": {
     "dynamics-crm": {
       "command": "python",
-      "args": ["<full-path-to>/dynamics-mcp/server.py"],
+      "args": ["C:\\full\\path\\to\\dynamics-mcp\\server.py"],
       "env": {
-        "DYNAMICS_CLIENT_ID": "your-client-id",
-        "DYNAMICS_TENANT_ID": "your-tenant-id",
-        "DYNAMICS_USER_ID": "your-user-id"
+        "DYNAMICS_CLIENT_ID": "your-azure-ad-app-client-id",
+        "DYNAMICS_TENANT_ID": "your-azure-ad-tenant-id",
+        "DYNAMICS_USER_ID": "your-systemuserid-guid"
       },
       "tools": ["*"]
     }
@@ -92,18 +80,31 @@ Add to your `~/.copilot/mcp-config.json`:
 }
 ```
 
-> **Tip:** You can also set the env vars in your shell profile or `.env` file instead of inline in the config.
+> **Note:** Use the full absolute path to `server.py`. On Windows use double backslashes.
 
-### 5. First run
+### 4. Restart and authenticate
 
-On first launch, the server will open a browser for interactive Azure AD login. After authenticating, the token is cached locally in `.token_cache.json`.
+Restart GitHub Copilot CLI. On first launch, a browser window will open for Azure AD login. After authenticating, your token is cached in `.token_cache.json` and refreshed automatically — you won't need to log in again.
 
-## Authentication
+### 5. Verify it works
 
-Uses MSAL (Microsoft Authentication Library) with the **public client** flow:
-- Tokens are cached in `.token_cache.json` (auto-refreshed)
-- First login requires interactive browser auth
-- Subsequent runs use cached/refresh tokens silently
+In Copilot CLI, try:
+```
+show me my accounts
+```
+or
+```
+what opportunities am I on the deal team for?
+```
+
+## Configuration Reference
+
+| Environment Variable | Description | Required |
+|---------------------|-------------|----------|
+| `DYNAMICS_CLIENT_ID` | Azure AD app registration client ID | **Yes** |
+| `DYNAMICS_TENANT_ID` | Azure AD tenant ID | **Yes** |
+| `DYNAMICS_USER_ID` | Your Dynamics `systemuserid` GUID | **Yes** |
+| `DYNAMICS_BASE_URL` | Dynamics instance URL | No (defaults to `https://microsoftsales.crm.dynamics.com`) |
 
 ## Architecture
 
@@ -124,6 +125,13 @@ Uses MSAL (Microsoft Authentication Library) with the **public client** flow:
 | `opportunity` | `opportunities` | Sales opportunities |
 | `account` | `accounts` | Customer accounts |
 | `contact` | `contacts` | Account contacts |
+
+## Troubleshooting
+
+- **"DYNAMICS_CLIENT_ID environment variable is required"** — You haven't set the env vars. Add them to the `env` block in your `mcp-config.json`.
+- **Browser doesn't open for login** — Make sure you're running the server in an environment that can open a browser. The first auth requires interactive login.
+- **Token expired** — Delete `.token_cache.json` and restart. It will prompt for login again.
+- **"Not connected" in Copilot CLI** — Restart Copilot CLI. MCP server reconnection sometimes requires a full restart.
 
 ## License
 
