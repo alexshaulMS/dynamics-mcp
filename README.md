@@ -5,7 +5,7 @@ An MCP (Model Context Protocol) server that connects to Microsoft Dynamics 365 C
 ## Features
 
 ### Account Management
-- **`my_accounts`** — List all parent accounts derived from your deal team memberships, with child accounts
+- **`my_accounts`** — List all accounts assigned to you via `msp_accountteams`
 - **`account_details`** — Full account details including parent/child hierarchy
 - **`account_contacts`** — Get contacts for an account
 - **`account_team`** — Account team members (auto-traverses to parent if child has no team)
@@ -23,56 +23,77 @@ An MCP (Model Context Protocol) server that connects to Microsoft Dynamics 365 C
 - **`my_milestones`** — All milestones across your deal team opportunities
 - **`opportunity_milestones`** — Milestones for a specific opportunity
 
+### Contact & Account Lookup
+- **`find_contact_by_email`** — Find contacts by email address with parent account resolution
+- **`find_account_by_domain`** — Find accounts by website/email domain (e.g. 'contoso.com')
+
+### Annotations & Notes
+- **`create_note`** — Create a note/comment on any record (milestones, opportunities, etc.)
+- **`search_annotations`** — Search existing notes on a record (timeline history, dedup checks)
+
 ### Discovery & Exploration
 - **`discover_entities`** — Search Dynamics metadata for entity names
 - **`discover_fields`** — Get fields/attributes for any entity
 - **`run_odata_query`** — Run custom OData queries for ad-hoc exploration
 
 ### Write Operations
+- **`create_record`** — Create a new record on any entity (generic)
 - **`update_record`** — Update a field on any record
 - **`assign_to_me`** — Assign a record (milestone, task, etc.) to yourself
 
 ## Prerequisites
 
 - Python 3.10+
-- [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) installed
-- Access to a Dynamics 365 CRM instance (e.g. `microsoftsales.crm.dynamics.com`)
-- An Azure AD app registration client ID with `Dynamics CRM user_impersonation` delegated permission (for Microsoft internal users, ask your team for the shared public client app ID)
+- Access to a Dynamics 365 CRM instance
+- An Azure AD app registration with `user_impersonation` permissions on your Dynamics instance
 
 ## Setup
 
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/alexshaulMS/dynamics-mcp.git
+git clone <this-repo>
 cd dynamics-mcp
 pip install -r requirements.txt
 ```
 
-### 2. Find your Dynamics User ID
+### 2. Create a `.env` file
 
-You need your `systemuserid` GUID. Open this URL in your browser while logged into Dynamics:
+Copy `.env.example` and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `DYNAMICS_BASE_URL` | Your Dynamics 365 instance URL | No (defaults to `https://microsoftsales.crm.dynamics.com`) |
+| `DYNAMICS_CLIENT_ID` | Azure AD app registration client ID | **Yes** |
+| `DYNAMICS_TENANT_ID` | Azure AD tenant ID | **Yes** |
+| `DYNAMICS_USER_ID` | Your `systemuserid` GUID from Dynamics 365 | **Yes** |
+
+### 3. Find your User ID
+
+To find your `systemuserid`, run this OData query in your browser (while authenticated):
 
 ```
-https://microsoftsales.crm.dynamics.com/api/data/v9.2/systemusers?$filter=internalemailaddress eq 'your.email@microsoft.com'&$select=systemuserid,fullname
+https://<your-instance>.crm.dynamics.com/api/data/v9.2/systemusers?$filter=internalemailaddress eq 'your.email@company.com'&$select=systemuserid,fullname
 ```
 
-Copy the `systemuserid` value from the response.
+### 4. Configure GitHub Copilot CLI
 
-### 3. Add to GitHub Copilot CLI
-
-Add the following to your `~/.copilot/mcp-config.json` (create the file if it doesn't exist):
+Add to your `~/.copilot/mcp-config.json`:
 
 ```json
 {
   "mcpServers": {
     "dynamics-crm": {
       "command": "python",
-      "args": ["C:\\full\\path\\to\\dynamics-mcp\\server.py"],
+      "args": ["<full-path-to>/dynamics-mcp/server.py"],
       "env": {
-        "DYNAMICS_CLIENT_ID": "your-azure-ad-app-client-id",
-        "DYNAMICS_TENANT_ID": "your-azure-ad-tenant-id",
-        "DYNAMICS_USER_ID": "your-systemuserid-guid"
+        "DYNAMICS_CLIENT_ID": "your-client-id",
+        "DYNAMICS_TENANT_ID": "your-tenant-id",
+        "DYNAMICS_USER_ID": "your-user-id"
       },
       "tools": ["*"]
     }
@@ -80,31 +101,18 @@ Add the following to your `~/.copilot/mcp-config.json` (create the file if it do
 }
 ```
 
-> **Note:** Use the full absolute path to `server.py`. On Windows use double backslashes.
+> **Tip:** You can also set the env vars in your shell profile or `.env` file instead of inline in the config.
 
-### 4. Restart and authenticate
+### 5. First run
 
-Restart GitHub Copilot CLI. On first launch, a browser window will open for Azure AD login. After authenticating, your token is cached in `.token_cache.json` and refreshed automatically — you won't need to log in again.
+On first launch, the server will open a browser for interactive Azure AD login. After authenticating, the token is cached locally in `.token_cache.json`.
 
-### 5. Verify it works
+## Authentication
 
-In Copilot CLI, try:
-```
-show me my accounts
-```
-or
-```
-what opportunities am I on the deal team for?
-```
-
-## Configuration Reference
-
-| Environment Variable | Description | Required |
-|---------------------|-------------|----------|
-| `DYNAMICS_CLIENT_ID` | Azure AD app registration client ID | **Yes** |
-| `DYNAMICS_TENANT_ID` | Azure AD tenant ID | **Yes** |
-| `DYNAMICS_USER_ID` | Your Dynamics `systemuserid` GUID | **Yes** |
-| `DYNAMICS_BASE_URL` | Dynamics instance URL | No (defaults to `https://microsoftsales.crm.dynamics.com`) |
+Uses MSAL (Microsoft Authentication Library) with the **public client** flow:
+- Tokens are cached in `.token_cache.json` (auto-refreshed)
+- First login requires interactive browser auth
+- Subsequent runs use cached/refresh tokens silently
 
 ## Architecture
 
@@ -125,13 +133,7 @@ what opportunities am I on the deal team for?
 | `opportunity` | `opportunities` | Sales opportunities |
 | `account` | `accounts` | Customer accounts |
 | `contact` | `contacts` | Account contacts |
-
-## Troubleshooting
-
-- **"DYNAMICS_CLIENT_ID environment variable is required"** — You haven't set the env vars. Add them to the `env` block in your `mcp-config.json`.
-- **Browser doesn't open for login** — Make sure you're running the server in an environment that can open a browser. The first auth requires interactive login.
-- **Token expired** — Delete `.token_cache.json` and restart. It will prompt for login again.
-- **"Not connected" in Copilot CLI** — Restart Copilot CLI. MCP server reconnection sometimes requires a full restart.
+| `annotation` | `annotations` | Notes/comments on records (timeline entries) |
 
 ## License
 

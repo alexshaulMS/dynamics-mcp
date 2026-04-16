@@ -3,12 +3,6 @@ Dynamics 365 CRM MCP Server
 Connects to Microsoft Dynamics 365 CRM via OData API with MSAL auth.
 Provides tools for querying accounts, opportunities, contacts, milestones,
 deal teams, and pipeline data.
-
-Configuration via environment variables:
-    DYNAMICS_BASE_URL     - Dynamics 365 instance URL (default: https://microsoftsales.crm.dynamics.com)
-    DYNAMICS_CLIENT_ID    - Azure AD app registration client ID (required)
-    DYNAMICS_TENANT_ID    - Azure AD tenant ID (required)
-    DYNAMICS_USER_ID      - Your Dynamics 365 systemuser GUID (required)
 """
 
 import os
@@ -20,23 +14,16 @@ import requests
 from fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
-# Configuration (from environment variables)
+# Configuration
 # ---------------------------------------------------------------------------
 
-BASE_URL = os.environ.get("DYNAMICS_BASE_URL", "https://microsoftsales.crm.dynamics.com")
+BASE_URL = "https://microsoftsales.crm.dynamics.com"
 API_URL = f"{BASE_URL}/api/data/v9.2"
-CLIENT_ID = os.environ.get("DYNAMICS_CLIENT_ID", "")
-TENANT_ID = os.environ.get("DYNAMICS_TENANT_ID", "")
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}" if TENANT_ID else ""
+CLIENT_ID = "51f81489-12ee-4a9e-aaae-a2591f45987d"
+TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47"
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = [f"{BASE_URL}/user_impersonation"]
-USER_ID = os.environ.get("DYNAMICS_USER_ID", "")
-
-if not CLIENT_ID:
-    raise RuntimeError("DYNAMICS_CLIENT_ID environment variable is required")
-if not TENANT_ID:
-    raise RuntimeError("DYNAMICS_TENANT_ID environment variable is required")
-if not USER_ID:
-    raise RuntimeError("DYNAMICS_USER_ID environment variable is required")
+USER_ID = "d8229040-69cf-f011-bbd3-7c1e5257b8e3"
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token_cache.json")
 
@@ -157,6 +144,7 @@ class DynamicsClient:
                 return rows
         except Exception:
             pass
+        # Fallback: return empty — callers should use my_account_tree() instead
         return []
 
     def my_account_tree(self) -> dict:
@@ -169,6 +157,7 @@ class DynamicsClient:
             child_map: dict mapping child_id -> parent_id
             name_map: dict mapping account_id -> account name
         """
+        # Step 1: Get my deal team entries -> opportunity IDs
         filt = f"_msp_dealteamuserid_value eq '{USER_ID}'"
         deal_rows = self.get("msp_dealteams", {"$filter": filt})
         opp_ids = list({
@@ -182,6 +171,7 @@ class DynamicsClient:
                 "parent_ids": set(), "child_map": {}, "name_map": {},
             }
 
+        # Step 2: Get accounts from those opportunities
         opp_clauses = " or ".join(f"opportunityid eq '{oid}'" for oid in opp_ids)
         opps = self.get("opportunities", {
             "$filter": opp_clauses,
@@ -197,6 +187,7 @@ class DynamicsClient:
                 "parent_ids": set(), "child_map": {}, "name_map": {},
             }
 
+        # Step 3: Fetch those accounts to find their parents
         acct_clauses = " or ".join(f"accountid eq '{a}'" for a in acct_ids)
         select = (
             "accountid,name,accountnumber,msp_parentinglevelcode,"
@@ -206,12 +197,14 @@ class DynamicsClient:
         )
         accts = self.get("accounts", {"$filter": acct_clauses, "$select": select})
 
+        # Step 4: Traverse up to top-level parents
         parent_ids: set[str] = set()
         seen_accts = {a["accountid"]: a for a in accts}
 
         for acct in accts:
             parent_ref = acct.get("_parentaccountid_value")
             if parent_ref and parent_ref not in seen_accts:
+                # Fetch the parent
                 try:
                     parent_acct = self.get_single(f"accounts({parent_ref})")
                     if parent_acct:
@@ -220,10 +213,12 @@ class DynamicsClient:
                 except Exception:
                     parent_ids.add(acct["accountid"])
             elif not parent_ref:
+                # This account IS a top-level parent
                 parent_ids.add(acct["accountid"])
             else:
                 parent_ids.add(parent_ref)
 
+        # Step 5: Get all children under each parent
         all_ids: set[str] = set(parent_ids)
         child_map: dict[str, str] = {}
         name_map: dict[str, str] = {}
@@ -236,12 +231,14 @@ class DynamicsClient:
                 child_map[cid] = pid
                 name_map[cid] = c.get("name", cid)
 
+        # Add parent names
         for pid in parent_ids:
             if pid in seen_accts:
                 name_map[pid] = seen_accts[pid].get("name", pid)
             else:
                 name_map[pid] = pid
 
+        # Build parent account list
         parent_accounts = []
         for pid in parent_ids:
             if pid in seen_accts:
@@ -510,7 +507,7 @@ def _resolve_opportunity(name: str) -> dict:
 
 @mcp.tool
 def my_accounts() -> list[dict]:
-    """List all Dynamics 365 accounts assigned to me via msp_accountteams.
+    """List all Dynamics 365 accounts assigned to me (Alexander Shaul) via msp_accountteams.
 
     Returns each account's name, segment, industry, managed status,
     open revenue, and parenting level.
@@ -523,6 +520,7 @@ def my_accounts() -> list[dict]:
     results = []
     for acct in parent_accounts:
         cleaned = client.clean_record(acct, ACCOUNT_FIELDS)
+        # Fetch child accounts for this parent
         children = client.get_child_accounts(acct["accountid"])
         cleaned["child_account_count"] = len(children)
         cleaned["child_accounts"] = [
@@ -679,6 +677,7 @@ def pipeline_summary() -> dict:
     if not all_ids:
         return {"total_pipeline": 0, "by_account": {}, "by_stage": {}}
 
+    # Fetch open opps
     raw_opps = client.get_opportunities(list(all_ids), statecode=0)
 
     by_account: dict[str, float] = {}
@@ -689,6 +688,7 @@ def pipeline_summary() -> dict:
         val = opp.get("estimatedvalue") or 0
         grand_total += val
 
+        # Map opp to parent account name
         opp_acct_id = opp.get("_parentaccountid_value")
         parent_id = child_map.get(opp_acct_id, opp_acct_id)
         acct_name = name_map.get(parent_id, opp.get(
@@ -696,12 +696,14 @@ def pipeline_summary() -> dict:
         ))
         by_account[acct_name] = by_account.get(acct_name, 0) + val
 
+        # Stage
         stage = opp.get(
             "msp_activesalesstage@OData.Community.Display.V1.FormattedValue",
             opp.get("msp_activesalesstage", "Unknown"),
         )
         by_stage[stage] = by_stage.get(stage, 0) + val
 
+    # Sort by value descending
     by_account = dict(sorted(by_account.items(), key=lambda x: x[1], reverse=True))
     by_stage = dict(sorted(by_stage.items(), key=lambda x: x[1], reverse=True))
 
@@ -923,7 +925,7 @@ def opportunity_team(opportunity_name: str) -> dict:
     """Get deal team members for an opportunity via msp_dealteams.
 
     Shows all people on the deal team, their roles,
-    and whether the current user is on the team.
+    and whether the current user (Alexander Shaul) is on the team.
 
     Args:
         opportunity_name: Full or partial opportunity name.
@@ -968,7 +970,7 @@ def opportunity_team(opportunity_name: str) -> dict:
 
 @mcp.tool
 def my_opportunities() -> dict:
-    """List all opportunities where I am connected as a deal team member.
+    """List all opportunities where I (Alexander Shaul) am connected as a deal team member.
 
     Searches msp_dealteams where my user ID appears, then resolves linked opportunities.
     """
@@ -1018,8 +1020,10 @@ def opportunities_not_on_team() -> dict:
     if not all_ids:
         return {"opportunity_count": 0, "opportunities": []}
 
+    # Get all open opportunities for these accounts
     all_opps = client.get_opportunities(list(all_ids), statecode=0)
 
+    # Get my deal team entries
     filt = f"_msp_dealteamuserid_value eq '{USER_ID}'"
     try:
         deal_rows = client.get("msp_dealteams", {"$filter": filt})
@@ -1032,6 +1036,7 @@ def opportunities_not_on_team() -> dict:
         if r.get("_msp_parentopportunityid_value")
     }
 
+    # Filter to opps I'm NOT on the deal team for
     not_on_team = [
         o for o in all_opps
         if o.get("opportunityid") not in my_opp_ids
@@ -1101,7 +1106,7 @@ def opportunity_milestones(opportunity_name: str) -> dict:
 
 @mcp.tool
 def my_milestones() -> dict:
-    """Get all milestones across opportunities where I am on the deal team.
+    """Get all milestones across opportunities where I (Alexander Shaul) am on the deal team.
 
     Finds my opportunities via msp_dealteams, then fetches milestones for each one.
     Returns milestones grouped by opportunity.
@@ -1201,6 +1206,246 @@ def my_milestones() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Contact & Account Lookup
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def find_contact_by_email(email: str) -> dict:
+    """Find a Dynamics 365 contact by email address and return their parent account.
+
+    Searches across emailaddress1, emailaddress2, and emailaddress3 fields.
+    Returns contact details and the linked parent account if available.
+
+    Args:
+        email: Email address to search for (case-insensitive).
+    """
+    email_lower = email.strip().lower()
+    filt = (
+        f"contains(emailaddress1, '{email_lower}') or "
+        f"contains(emailaddress2, '{email_lower}') or "
+        f"contains(emailaddress3, '{email_lower}')"
+    )
+    select = (
+        "contactid,fullname,emailaddress1,emailaddress2,emailaddress3,"
+        "jobtitle,_parentcustomerid_value"
+    )
+    try:
+        contacts = client.get("contacts", {"$filter": filt, "$select": select})
+    except requests.HTTPError as e:
+        return {"error": str(e), "hint": "Check email format and permissions."}
+
+    if not contacts:
+        return {"found": False, "email": email, "contacts": []}
+
+    results = []
+    for c in contacts:
+        entry = client.clean_record(c, [
+            "contactid", "fullname", "emailaddress1", "emailaddress2",
+            "emailaddress3", "jobtitle", "_parentcustomerid_value",
+        ])
+        # Resolve parent account name
+        acct_id = c.get("_parentcustomerid_value")
+        fmt_key = "_parentcustomerid_value@OData.Community.Display.V1.FormattedValue"
+        entry["parent_account_name"] = c.get(fmt_key, "")
+        entry["parent_account_id"] = acct_id or ""
+        results.append(entry)
+
+    return {"found": True, "email": email, "contact_count": len(results), "contacts": results}
+
+
+@mcp.tool
+def find_account_by_domain(domain: str) -> dict:
+    """Find Dynamics 365 accounts whose website or email domains match the given domain.
+
+    Useful for matching meeting attendees to accounts when you only have
+    an email domain (e.g. 'contoso.com').
+
+    Args:
+        domain: Domain to search for (e.g. 'contoso.com').
+    """
+    domain_lower = domain.strip().lower()
+    filt = (
+        f"contains(websiteurl, '{domain_lower}') or "
+        f"contains(emailaddress1, '{domain_lower}')"
+    )
+    select = "accountid,name,websiteurl,emailaddress1,_parentaccountid_value"
+    try:
+        accounts = client.get("accounts", {"$filter": filt, "$select": select})
+    except requests.HTTPError as e:
+        return {"error": str(e), "hint": "Check domain format and permissions."}
+
+    if not accounts:
+        return {"found": False, "domain": domain, "accounts": []}
+
+    results = []
+    for a in accounts:
+        entry = client.clean_record(a, [
+            "accountid", "name", "websiteurl", "emailaddress1",
+            "_parentaccountid_value",
+        ])
+        fmt_key = "_parentaccountid_value@OData.Community.Display.V1.FormattedValue"
+        entry["parent_account_name"] = a.get(fmt_key, "")
+        results.append(entry)
+
+    return {"found": True, "domain": domain, "account_count": len(results), "accounts": results}
+
+
+# ---------------------------------------------------------------------------
+# Annotation / Notes Operations
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def create_note(
+    regarding_entity: str,
+    regarding_id: str,
+    note_text: str,
+    subject: str = "",
+) -> dict:
+    """Create an annotation (note) on a Dynamics 365 record.
+
+    Use this to add comments/notes to milestones, opportunities, or any entity
+    that supports annotations. The note will appear in the record's timeline.
+
+    Args:
+        regarding_entity: The logical entity name the note is about
+            (e.g. 'msp_milestone', 'opportunity', 'account').
+        regarding_id: The GUID of the record the note relates to.
+        note_text: The body text of the note (supports plain text).
+        subject: Optional subject/title for the note.
+    """
+    payload = {
+        f"objectid_{regarding_entity}@odata.bind": f"/{regarding_entity}s({regarding_id})",
+        "notetext": note_text,
+    }
+    if subject:
+        payload["subject"] = subject
+
+    try:
+        result = client.post("annotations", payload)
+        return {
+            "status": "created",
+            "regarding_entity": regarding_entity,
+            "regarding_id": regarding_id,
+            "subject": subject,
+            "entity_id": result.get("entity_id", ""),
+        }
+    except requests.HTTPError as e:
+        error_body = ""
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                error_body = e.response.json()
+            except Exception:
+                error_body = e.response.text[:500]
+        return {
+            "error": str(e),
+            "error_detail": error_body,
+            "hint": (
+                "Check that the entity supports annotations and that the "
+                "regarding_entity uses the correct logical name (singular, "
+                "e.g. 'msp_milestone' not 'msp_milestones'). "
+                "Use discover_entities to verify."
+            ),
+        }
+
+
+@mcp.tool
+def search_annotations(
+    regarding_entity: str,
+    regarding_id: str,
+    search_text: str = "",
+    top: int = 20,
+) -> dict:
+    """Search annotations (notes) on a Dynamics 365 record.
+
+    Use this to check for existing notes before creating duplicates,
+    or to review the note history on a milestone/opportunity.
+
+    Args:
+        regarding_entity: The logical entity name (e.g. 'msp_milestone', 'opportunity').
+        regarding_id: The GUID of the record to search notes for.
+        search_text: Optional text to filter notes by (searches subject and notetext).
+        top: Maximum number of notes to return (default 20).
+    """
+    filt = f"_objectid_value eq '{regarding_id}'"
+    if search_text:
+        filt += f" and (contains(subject, '{search_text}') or contains(notetext, '{search_text}'))"
+
+    params: dict = {
+        "$filter": filt,
+        "$select": "annotationid,subject,notetext,createdon,_createdby_value",
+        "$orderby": "createdon desc",
+        "$top": str(top),
+    }
+    try:
+        notes = client.get("annotations", params)
+    except requests.HTTPError as e:
+        return {"error": str(e), "hint": "Check entity and record ID."}
+
+    results = []
+    for n in notes:
+        entry = client.clean_record(n, [
+            "annotationid", "subject", "notetext", "createdon", "_createdby_value",
+        ])
+        fmt_key = "_createdby_value@OData.Community.Display.V1.FormattedValue"
+        entry["created_by_name"] = n.get(fmt_key, "")
+        results.append(entry)
+
+    return {
+        "regarding_entity": regarding_entity,
+        "regarding_id": regarding_id,
+        "note_count": len(results),
+        "notes": results,
+    }
+
+
+@mcp.tool
+def create_record(entity_set: str, fields: str) -> dict:
+    """Create a new record in Dynamics 365.
+
+    Use discover_entities and discover_fields to find the correct entity set
+    and field names before creating.
+
+    Args:
+        entity_set: The entity set name (e.g. 'annotations', 'tasks', 'phonecalls').
+        fields: JSON string of field names and values.
+            Example: '{"subject": "Follow-up", "description": "Call notes..."}'
+            For lookup fields, use OData bind syntax:
+            '{"objectid_msp_milestone@odata.bind": "/msp_milestones(GUID)"}'
+    """
+    import json as _json
+
+    try:
+        field_data = _json.loads(fields)
+    except _json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON in fields: {e}", "hint": "Provide a valid JSON string."}
+
+    if not isinstance(field_data, dict):
+        return {"error": "fields must be a JSON object (dict), not a list or scalar."}
+
+    try:
+        result = client.post(entity_set, field_data)
+        return {
+            "status": "created",
+            "entity_set": entity_set,
+            "entity_id": result.get("entity_id", ""),
+        }
+    except requests.HTTPError as e:
+        error_body = ""
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                error_body = e.response.json()
+            except Exception:
+                error_body = e.response.text[:500]
+        return {
+            "error": str(e),
+            "error_detail": error_body,
+            "hint": "Use discover_fields to check valid field names for this entity.",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Write Operations
 # ---------------------------------------------------------------------------
 
@@ -1236,7 +1481,7 @@ def update_record(entity_set: str, record_id: str, field_name: str, field_value:
 
 @mcp.tool
 def assign_to_me(entity_set: str, record_id: str) -> dict:
-    """Assign a Dynamics 365 record (milestone, task, etc.) to me.
+    """Assign a Dynamics 365 record (milestone, task, etc.) to me (Alexander Shaul).
 
     Sets the ownerid field to my user ID.
 
