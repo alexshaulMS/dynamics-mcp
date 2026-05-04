@@ -23,7 +23,7 @@ CLIENT_ID = "51f81489-12ee-4a9e-aaae-a2591f45987d"
 TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47"
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = [f"{BASE_URL}/user_impersonation"]
-USER_ID = "d8229040-69cf-f011-bbd3-7c1e5257b8e3"
+USER_ID = ""
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token_cache.json")
 
