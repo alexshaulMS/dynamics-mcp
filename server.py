@@ -19,9 +19,9 @@ from fastmcp import FastMCP
 
 BASE_URL = "https://microsoftsales.crm.dynamics.com"
 API_URL = f"{BASE_URL}/api/data/v9.2"
-CLIENT_ID = "51f81489-12ee-4a9e-aaae-a2591f45987d"
-TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47"
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+CLIENT_ID = ""
+TENANT_ID = ""
+AUTHORITY = f""
 SCOPES = [f"{BASE_URL}/user_impersonation"]
 USER_ID = ""
 
